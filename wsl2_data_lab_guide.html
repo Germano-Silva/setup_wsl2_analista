@@ -921,12 +921,12 @@
         <div class="terminal-body">
           <div class="tl">
             <span class="tl-prompt">$</span>
-            <span class="tl-cmd">wget -O setup.sh
-              https://raw.githubusercontent.com/seu-usuario/wsl2-data-lab/main/setup_wsl2_analista.sh</span>
+            <span class="tl-cmd">wget -O setup_wsl2_analista.sh
+              https://raw.githubusercontent.com/Germano-Silva/wsl2-data-lab/blob/main/setup_wsl2_analista.sh</span>
           </div>
           <div class="tl">
             <span class="tl-prompt">$</span>
-            <span class="tl-cmd">chmod +x setup.sh && ./setup.sh</span>
+            <span class="tl-cmd">chmod +x setup_wsl2_analista.sh && ./setup_wsl2_analista.sh</span>
           </div>
           <div class="tl">
             <span class="tl-prompt" style="color:var(--text-dim)">→</span>
@@ -1289,7 +1289,7 @@
 
     // ── COPY COMMAND ─────────────────────────────────────────────────────────
     function copyCmd() {
-      const cmd = 'wget -O setup.sh https://raw.githubusercontent.com/seu-usuario/wsl2-data-lab/main/setup_wsl2_analista.sh && chmod +x setup.sh && ./setup.sh';
+      const cmd = 'wget -O setup_wsl2_analista.sh https://raw.githubusercontent.com/Germano-Silva/wsl2-data-lab/blob/main/setup_wsl2_analista.sh && chmod +x setup_wsl2_analista.sh && ./setup_wsl2_analista.sh';
       navigator.clipboard.writeText(cmd).then(() => {
         const btn = document.getElementById('copy-btn');
         btn.textContent = '✓ Copiado!';

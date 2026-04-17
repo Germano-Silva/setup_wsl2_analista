@@ -150,19 +150,44 @@ O Windows 11 Home pode exigir instalação manual do WSL2:
 
 ## 🚀 Executando o Script
 
-Com o WSL2 instalado e o Ubuntu aberto, execute:
+Opção A — Git Clone (recomendado)
+
+```bash
+# 1. Clone o repositório
+git clone https://github.com/Germano-Silva/wsl2-data-lab.git
+
+# 2. Entre na pasta do projeto
+cd wsl2-data-lab
+
+# 3. Dê permissão de execução ao script
+chmod +x setup_wsl2_analista.sh
+
+# 4. Execute
+bash setup_wsl2_analista.sh
+```
+
+Opção B - Com o WSL2 instalado e o Ubuntu aberto, execute:
 
 ```bash
 # 1. Baixe o script
-wget -O setup.sh https://raw.githubusercontent.com/seu-usuario/wsl2-data-lab/main/setup_wsl2_analista.sh
+wget -O setup_wsl2_analista.sh https://raw.githubusercontent.com/Germano-Silva/wsl2-data-lab/blob/main/setup_wsl2_analista.sh
 
 # 2. Dê permissão de execução
-chmod +x setup.sh
+chmod +x setup_wsl2_analista.sh
 
 # 3. Execute
-./setup.sh
+./setup_wsl2_analista.sh
 ```
+Opção C - Com o WSL2 instalado e o Ubuntu aberto, execute:
+```bash
+# 1. Baixe o script no windows
+https://raw.githubusercontent.com/Germano-Silva/wsl2-data-lab/main/setup_wsl2_analista.sh
 
+# 2. Copie o arquivo e cole na pasta C: do seu WSL
+
+# 3. Execute no terminal do Ubuntu
+bash setup_wsl2_analista.sh
+```
 Quando perguntar `Deseja continuar? [s/N]`, digite **`s`** e pressione Enter.
 
 > **Não feche o terminal** durante a instalação. O script exibirá spinners, barras de progresso e o status de cada etapa em tempo real. Um arquivo de log completo é gerado em `~/.wsl2_setup_<timestamp>.log`.
