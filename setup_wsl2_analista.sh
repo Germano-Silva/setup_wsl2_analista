@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# WSL2 Setup Completo para Analista de Dados — v2
+# WSL2 Setup Completo para Analista de Dados — v2.1
 # Autor: Claude | Data: 2026
+#
+# MUDANÇAS v2.1:
+#   - NOVO módulo 14: dlab — Data Lab CLI (catálogo + linhagem + diagnóstico)
 #
 # MUDANÇAS v2:
 #   - Feedback visual com spinners, barras de progresso e timestamps
@@ -185,7 +188,7 @@ banner() {
   ██████╔╝██║  ██║   ██║   ██║  ██║    ███████╗██║  ██║██████╔╝
   ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝    ╚══════╝╚═╝  ╚═╝╚═════╝
 EOF
-  echo -e "${NC}  ${BOLD}WSL2 Setup Completo — Analista de Dados 2026  ${DIM}[v2]${NC}"
+  echo -e "${NC}  ${BOLD}WSL2 Setup Completo — Analista de Dados 2026  ${DIM}[v2.1]${NC}"
   echo -e "  ${DIM}Log em: $LOG_FILE${NC}"
 }
 
@@ -406,8 +409,6 @@ setup_python_packages() {
   pip_install_list PKGS_VIZ
 
   # --- Grupo 3: Jupyter ---
-  # NOTA: jupyterlab 4.x não aceita jupyterlab-lsp<4 nem jupyterlab-drawio<0.9
-  # Instalamos somente o core aqui; extensões de Lab 4.x vão no passo 10
   echo -e "\n  ${BOLD}${DIM}▸ Jupyter (core)${NC}"
   local PKGS_JUPYTER=(
     "jupyterlab>=4.0"
@@ -436,14 +437,9 @@ setup_python_packages() {
   pip_install_list PKGS_CLOUD
 
   # --- Grupo 7: ELT e Orquestração ---
-  # ATENÇÃO (detectado em execução anterior):
-  #   • prefect 3.x exige rich<15.0  — instalar dbt+prefect ANTES de rich
-  #   • dbt-core 1.x exige pathspec<0.13 — pin explícito necessário
-  # Estratégia: instalar o grupo ELT primeiro (com seus constraints),
-  # depois rich/pathspec com versão compatível no grupo de utilitários.
   echo -e "\n  ${BOLD}${DIM}▸ ELT e Orquestração${NC}"
   local PKGS_ELT=(
-    "pathspec>=0.9,<0.13"   # pin: dbt-core 1.x não aceita pathspec>=0.13
+    "pathspec>=0.9,<0.13"
     dbt-core
     dbt-postgres
     dbt-bigquery
@@ -458,9 +454,6 @@ setup_python_packages() {
   pip_install_list PKGS_QUALITY
 
   # --- Grupo 9: APIs e utilitários ---
-  # rich: pin <15.0 porque prefect 3.x declara rich<15.0 como dependência.
-  # Instalar rich DEPOIS do prefect (grupo 7) garante que o pip já conhece
-  # o constraint e não vai tentar atualizar para 15.x.
   echo -e "\n  ${BOLD}${DIM}▸ APIs e Utilitários${NC}"
   local PKGS_UTIL=(
     requests httpx fastapi uvicorn
@@ -505,9 +498,6 @@ setup_node() {
   export NVM_DIR="$HOME/.nvm"
   [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 
-  # NOTA: nvm usa variáveis internas não declaradas — set -u deve ficar desligado
-  # durante TODO o bloco do nvm, incluindo a iteração de pacotes npm que vem
-  # logo depois. Religa set -u somente ao sair da função.
   set +u
 
   spinner_start "Instalando Node.js LTS..."
@@ -517,9 +507,6 @@ setup_node() {
   spinner_stop 0 "Node.js $(node -v) instalado"
   INSTALLED_VERSIONS+=("node $(node -v)")
 
-  # Array declarado DEPOIS de carregar nvm e com set -u desligado.
-  # Usando loop "for item in list" em vez de índice numérico — evita
-  # o bug "unbound variable" com ${!array[@]} no Bash 5.0 (Ubuntu 20.04).
   local npm_ok=0
   local npm_fail=0
   local npm_total=7
@@ -537,7 +524,7 @@ setup_node() {
   done
   printf "\r%-70s\r" " "
 
-  set -u   # Religa set -u somente aqui, fora do escopo do nvm
+  set -u
 
   if [[ $npm_fail -eq 0 ]]; then
     ok "$npm_ok pacotes npm globais instalados"
@@ -582,7 +569,6 @@ setup_rust() {
   done
   printf "\r%-70s\r" " "
 
-  # delta separado (nome do crate é git-delta)
   spinner_start "Instalando delta (git diff)..."
   if cargo install git-delta >> "$LOG_FILE" 2>&1; then
     spinner_stop 0 "delta instalado"
@@ -645,13 +631,11 @@ setup_docker() {
 setup_databases() {
   step 8 "Bancos de Dados"
 
-  # PostgreSQL + Redis
   spinner_start "Instalando PostgreSQL e Redis..."
   sudo apt-get install -y -qq postgresql postgresql-client redis-server redis-tools \
     sqlite3 >> "$LOG_FILE" 2>&1
   spinner_stop 0 "PostgreSQL, Redis e SQLite3 instalados"
 
-  # DuckDB CLI
   if ! command -v duckdb &>/dev/null; then
     spinner_start "Baixando DuckDB CLI..."
     local duck_version="v0.10.2"
@@ -667,7 +651,6 @@ setup_databases() {
     ok "DuckDB já instalado: $(duckdb --version 2>/dev/null)"
   fi
 
-  # Smoke test básico
   if echo "SELECT 42 AS test;" | duckdb :memory: >> "$LOG_FILE" 2>&1; then
     detail "Smoke test DuckDB OK (SELECT 42)"
   else
@@ -719,21 +702,6 @@ TMUX
 
 # =============================================================================
 # 10. JUPYTERLAB — CORRIGIDO
-#
-# PROBLEMAS DA VERSÃO ANTERIOR:
-#   a) jupyterlab-lsp 4.3.x requer jupyterlab<4.0 — incompatível com Lab 4.x
-#   b) jupyterlab-drawio 0.9 requer jupyterlab==3.* — incompatível com Lab 4.x
-#   c) As extensões eram instaladas uma a uma sem verificação de compatibilidade
-#   d) jupyter lab --generate-config pode travar se houver extensões quebradas
-#   e) Nenhum smoke test ao final
-#   f) O passo estava COMENTADO no main() mas sem aviso ao usuário
-#
-# SOLUÇÃO:
-#   - Extensões compatíveis com JupyterLab 4.x explícitas com pin de versão
-#   - Instalação em dois batches (pip + jupyter labextension) com fallback
-#   - generate-config com timeout
-#   - Smoke test: "jupyter lab --version" e "jupyter kernelspec list"
-#   - Registro claro de qual extensão falhou e por quê
 # =============================================================================
 setup_jupyter() {
   step 10 "JupyterLab — Extensões e Configuração"
@@ -742,7 +710,6 @@ setup_jupyter() {
   export PATH="$PYENV_ROOT/bin:$PATH"
   eval "$(pyenv init -)" 2>/dev/null || true
 
-  # Verifica versão do Lab instalado
   local lab_ver
   lab_ver=$(pip show jupyterlab 2>/dev/null | awk '/^Version:/{print $2}')
   if [[ -z "$lab_ver" ]]; then
@@ -756,25 +723,19 @@ setup_jupyter() {
   lab_major=$(echo "$lab_ver" | cut -d. -f1)
   info "JupyterLab $lab_ver detectado (major=$lab_major)"
 
-  # ── Extensões compatíveis com Lab 4.x ─────────────────────────────────────
-  # jupyterlab-lsp>=5.0 suporta Lab 4.x (o 4.3 não suportava)
-  # jupyterlab-git já foi instalado no passo 4 como dependência do core
-  # Extensões Lab 3.x (drawio 0.9, lsp 4.x) são INTENCIONALMENTE omitidas
-
   local EXTS_LAB4=(
-    "jupyterlab-lsp>=5.0"          # LSP para Lab 4.x
-    "python-lsp-server[all]"       # Backend LSP
-    "jupyterlab_code_formatter"    # Formatter (Black/isort)
-    "black"                        # Formatter backend
-    "isort"                        # Import sorter
+    "jupyterlab-lsp>=5.0"
+    "python-lsp-server[all]"
+    "jupyterlab_code_formatter"
+    "black"
+    "isort"
   )
 
   local EXTS_OPTIONAL=(
-    "theme-darcula"                # Tema escuro
-    "nbdime"                       # Diff de notebooks
+    "theme-darcula"
+    "nbdime"
   )
 
-  # Batch 1: Extensões essenciais
   echo -e "\n  ${BOLD}${DIM}▸ Extensões essenciais (compatíveis com Lab ${lab_ver})${NC}"
   local total=${#EXTS_LAB4[@]}
   local ext_ok=0
@@ -801,7 +762,6 @@ setup_jupyter() {
     warn "$ext_ok instaladas  |  $ext_fail falharam (veja $LOG_FILE)"
   fi
 
-  # Batch 2: Extensões opcionais (falha não impede continuar)
   echo -e "\n  ${BOLD}${DIM}▸ Extensões opcionais${NC}"
   local total_opt=${#EXTS_OPTIONAL[@]}
   for i in "${!EXTS_OPTIONAL[@]}"; do
@@ -810,12 +770,10 @@ setup_jupyter() {
     ext_name=$(echo "$ext" | sed 's/[>=<].*//')
     progress_bar "$(( i + 1 ))" "$total_opt" "$ext_name"
     pip install --upgrade --quiet --timeout 60 "$ext" >> "$LOG_FILE" 2>&1 || true
-    # Falha silenciosa intencional: extensões opcionais não devem abortar
   done
   printf "\r%-70s\r" " "
   ok "Extensões opcionais processadas"
 
-  # ── Configura o kernel Python ──────────────────────────────────────────────
   spinner_start "Registrando kernel Python no Jupyter..."
   if python3 -m ipykernel install --user --name python3 \
        --display-name "Python 3 (pyenv)" >> "$LOG_FILE" 2>&1; then
@@ -825,7 +783,6 @@ setup_jupyter() {
     FAILED_STEPS+=("jupyter-kernel")
   fi
 
-  # ── Gera configuração com timeout ─────────────────────────────────────────
   spinner_start "Gerando arquivo de configuração JupyterLab..."
   if timeout 30 jupyter lab --generate-config -y >> "$LOG_FILE" 2>&1; then
     spinner_stop 0 "Configuração gerada em ~/.jupyter/"
@@ -834,20 +791,16 @@ setup_jupyter() {
     FAILED_STEPS+=("jupyter-generate-config")
   fi
 
-  # ── Cria script de atalho ──────────────────────────────────────────────────
   mkdir -p "$HOME/.local/bin"
   cat > "$HOME/.local/bin/jlab" <<'JLAB'
 #!/bin/bash
-# Inicia JupyterLab no diretório especificado (ou ~/data-projects por padrão)
 cd "${1:-$HOME/data-projects}" && jupyter lab --no-browser "$@"
 JLAB
   chmod +x "$HOME/.local/bin/jlab"
   ok "Atalho 'jlab' criado em ~/.local/bin/jlab"
 
-  # ── Smoke tests ───────────────────────────────────────────────────────────
   echo -e "\n  ${BOLD}${DIM}▸ Smoke tests${NC}"
 
-  # Teste 1: versão do Lab
   local actual_lab_ver
   actual_lab_ver=$(timeout 10 jupyter lab --version 2>/dev/null || echo "FALHOU")
   if [[ "$actual_lab_ver" != "FALHOU" ]]; then
@@ -857,7 +810,6 @@ JLAB
     FAILED_STEPS+=("smoke:jupyter-lab-version")
   fi
 
-  # Teste 2: kernel list
   local kernels
   kernels=$(timeout 10 jupyter kernelspec list 2>/dev/null || echo "FALHOU")
   if [[ "$kernels" != "FALHOU" ]] && echo "$kernels" | grep -q "python"; then
@@ -867,7 +819,6 @@ JLAB
     FAILED_STEPS+=("smoke:jupyter-kernel-list")
   fi
 
-  # Teste 3: LSP server
   if python3 -c "import pylsp" >> "$LOG_FILE" 2>&1; then
     detail "python-lsp-server importável  ${TICK}"
   else
@@ -1031,6 +982,89 @@ VSC
 }
 
 # =============================================================================
+# 14. DLAB — Data Lab CLI (catálogo + linhagem + diagnóstico)
+#
+# O dlab é a camada que transforma este projeto de "instalador de uso único"
+# em uma ferramenta com vida útil contínua. Implementa:
+#   • dlab catalog scan      — varre ~/data-projects e indexa todos os dados
+#   • dlab catalog list      — lista arquivos rastreados
+#   • dlab catalog lineage   — mostra quais notebooks leram/escreveram um arquivo
+#   • dlab describe <file>   — perfil rápido: shape, dtypes, % de nulos, head
+#   • dlab doctor            — diagnóstico do ambiente
+#
+# Usa somente dependências já instaladas nos passos anteriores:
+#   typer, rich<15.0, duckdb, polars
+# =============================================================================
+setup_dlab() {
+  step 14 "dlab — Data Lab CLI"
+
+  export PYENV_ROOT="$HOME/.pyenv"
+  export PATH="$PYENV_ROOT/bin:$PATH"
+  eval "$(pyenv init -)" 2>/dev/null || true
+
+  # Dependências já foram instaladas no passo 4, mas garantimos aqui
+  # caso o usuário tenha comentado aquele módulo
+  spinner_start "Verificando dependências Python do dlab..."
+  pip install --quiet --timeout 60 typer "rich<15.0" duckdb polars >> "$LOG_FILE" 2>&1
+  spinner_stop 0 "Dependências OK"
+
+  # Localiza o binário `dlab` no repo (várias heurísticas — robusto a
+  # diferentes formas de executar o script)
+  local dlab_src=""
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  for candidate in \
+      "$script_dir/bin/dlab" \
+      "./bin/dlab" \
+      "./dlab" \
+      "$HOME/wsl2-data-lab/bin/dlab"; do
+    if [[ -f "$candidate" ]]; then
+      dlab_src="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$dlab_src" ]]; then
+    warn "Arquivo 'bin/dlab' não encontrado no repositório."
+    detail "Garanta que você clonou o repo com a pasta bin/ incluída."
+    FAILED_STEPS+=("dlab:missing-source")
+    end_step
+    return 0
+  fi
+
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 "$dlab_src" "$HOME/.local/bin/dlab"
+  ok "dlab instalado em ~/.local/bin/dlab"
+
+  # Aliases no .zshrc (idempotente — só adiciona se ainda não existir)
+  if ! grep -q "# dlab aliases" "$HOME/.zshrc" 2>/dev/null; then
+    cat >> "$HOME/.zshrc" <<'DLAB_ALIAS'
+
+# dlab aliases
+alias dl='dlab'
+alias dlc='dlab catalog'
+alias dls='dlab catalog scan'
+alias dld='dlab describe'
+alias dldr='dlab doctor'
+DLAB_ALIAS
+    ok "Aliases do dlab adicionados ao .zshrc (dl, dlc, dls, dld, dldr)"
+  else
+    ok "Aliases do dlab já presentes"
+  fi
+
+  # Primeiro scan (não crítico — a pasta pode estar vazia)
+  if [[ -d "$HOME/data-projects" ]]; then
+    spinner_start "Executando primeiro scan do catálogo..."
+    "$HOME/.local/bin/dlab" catalog scan >> "$LOG_FILE" 2>&1 || true
+    spinner_stop 0 "Catálogo inicializado em ~/.dlab/catalog.duckdb"
+  fi
+
+  INSTALLED_VERSIONS+=("dlab (Data Lab CLI)")
+  detail "Experimente: dlab doctor  |  dlab catalog scan  |  dlab describe <arquivo>"
+  end_step
+}
+
+# =============================================================================
 # SUMÁRIO FINAL
 # =============================================================================
 print_summary() {
@@ -1044,7 +1078,6 @@ print_summary() {
   printf  "║   ⏱  Tempo total: %-44s║\n" "${mins}m ${secs}s"
   echo -e "╚══════════════════════════════════════════════════════════════════╝${NC}"
 
-  # Versões instaladas
   if [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]]; then
     echo -e "\n${BOLD}Versões instaladas:${NC}"
     for v in "${INSTALLED_VERSIONS[@]}"; do
@@ -1052,7 +1085,6 @@ print_summary() {
     done
   fi
 
-  # Ignorados (já existiam)
   if [[ ${#SKIPPED_STEPS[@]} -gt 0 ]]; then
     echo -e "\n${BOLD}${DIM}Já instalados (ignorados):${NC}"
     for s in "${SKIPPED_STEPS[@]}"; do
@@ -1060,7 +1092,6 @@ print_summary() {
     done
   fi
 
-  # Falhas não-críticas
   if [[ ${#FAILED_STEPS[@]} -gt 0 ]]; then
     echo -e "\n${BOLD}${YELLOW}Avisos (não-críticos):${NC}"
     for f in "${FAILED_STEPS[@]}"; do
@@ -1069,16 +1100,16 @@ print_summary() {
     echo -e "  ${DIM}Detalhes: $LOG_FILE${NC}"
   fi
 
-  # Próximos passos
   echo -e "\n${BOLD}Próximos passos:${NC}"
   echo -e "  1. ${CYAN}exec zsh${NC}                          — recarregar o shell"
   echo -e "  2. ${CYAN}git config --global user.name 'Seu Nome'${NC}"
   echo -e "  3. ${CYAN}git config --global user.email 'email'${NC}"
   echo -e "  4. Copiar ${CYAN}~/wslconfig_tip.txt${NC} → ${CYAN}C:\\Users\\<Usuário>\\.wslconfig${NC}"
   echo -e "  5. ${CYAN}jlab${NC}                              — iniciar JupyterLab"
-  echo -e "  6. ${CYAN}bash ~/vscode_extensions_data.sh${NC}  — instalar extensões VS Code"
-  echo -e "  7. ${CYAN}docker run hello-world${NC}            — testar Docker"
-  echo -e "  8. ${CYAN}duckdb :memory: 'SELECT 42 AS ok'${NC} — testar DuckDB"
+  echo -e "  6. ${CYAN}dlab doctor${NC}                       — verificar saúde do ambiente"
+  echo -e "  7. ${CYAN}dlab catalog scan${NC}                 — indexar seus dados"
+  echo -e "  8. ${CYAN}bash ~/vscode_extensions_data.sh${NC}  — instalar extensões VS Code"
+  echo -e "  9. ${CYAN}docker run hello-world${NC}            — testar Docker"
   echo ""
   echo -e "  ${DIM}Log completo: $LOG_FILE${NC}"
 }
@@ -1111,10 +1142,11 @@ main() {
   setup_docker
   setup_databases
   setup_productivity
-  setup_jupyter        # ← Passo 10 agora habilitado e corrigido
+  setup_jupyter
   setup_folders
   setup_wsl_config
   setup_vscode_list
+  setup_dlab            # NOVO v2.1: Data Lab CLI
 
   print_summary
 }

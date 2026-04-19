@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""
+dlab — Data Lab CLI
+The missing command center for your WSL2 Data Lab.
+
+Daily usage examples:
+  dlab catalog scan                       # refresh the local data catalog
+  dlab catalog list --project meu-proj    # list tracked files
+  dlab catalog show vendas_2024.csv       # metadata for a single file
+  dlab catalog lineage vendas_2024.csv    # which notebooks read/wrote it
+  dlab describe data/raw/vendas.csv       # quick profile (shape, dtypes, nulls)
+  dlab doctor                             # environment health check
+"""
+import sys
+import re
+import hashlib
+import shutil
+from pathlib import Path
+from datetime import datetime, timezone
+
+try:
+    import typer
+    import duckdb
+    from rich.console import Console
+    from rich.table import Table
+    from rich.tree import Tree
+    from rich.panel import Panel
+except ImportError as exc:
+    print(f"[dlab] Dependência ausente: {exc.name}")
+    print("  Instale com: pip install typer 'rich<15.0' duckdb")
+    sys.exit(1)
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
+app = typer.Typer(
+    help="dlab — orquestrador do seu WSL2 Data Lab.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+catalog_app = typer.Typer(no_args_is_help=True, help="Catálogo local de dados & linhagem")
+app.add_typer(catalog_app, name="catalog")
+console = Console()
+
+DLAB_HOME = Path.home() / ".dlab"
+CATALOG_DB = DLAB_HOME / "catalog.duckdb"
+PROJECTS_DIR = Path.home() / "data-projects"
+
+DATA_EXTS = {".csv", ".tsv", ".parquet", ".xlsx", ".xls", ".json", ".jsonl",
+             ".feather", ".arrow", ".db", ".sqlite", ".duckdb"}
+CODE_EXTS = {".ipynb", ".py"}
+SKIP_DIR_NAMES = {"__pycache__", ".venv", "venv", ".ipynb_checkpoints",
+                  "node_modules", ".git"}
+
+# Lineage detection — intentionally loose, catches the 95% case
+READ_PATTERNS = [
+    re.compile(r"""(?:pd|pandas|pl|polars)\s*\.\s*read_(?:csv|parquet|excel|json|feather|sql)\s*\(\s*["']([^"']+)["']""", re.I),
+    re.compile(r"""(?:duckdb)\s*\.\s*(?:read_csv|read_parquet|sql|query)\s*\(\s*["']([^"']+)["']""", re.I),
+    re.compile(r"""open\s*\(\s*["']([^"']+\.(?:csv|tsv|parquet|json|jsonl|xlsx))["']""", re.I),
+]
+WRITE_PATTERNS = [
+    re.compile(r"""\.to_(?:csv|parquet|excel|json|feather)\s*\(\s*["']([^"']+)["']""", re.I),
+    re.compile(r"""\.write_(?:csv|parquet|json|ndjson|ipc)\s*\(\s*["']([^"']+)["']""", re.I),
+]
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+def _conn():
+    DLAB_HOME.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(CATALOG_DB))
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            path          VARCHAR PRIMARY KEY,
+            project       VARCHAR,
+            kind          VARCHAR,
+            format        VARCHAR,
+            size_bytes    BIGINT,
+            hash_prefix   VARCHAR,
+            last_modified TIMESTAMP,
+            last_scanned  TIMESTAMP
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS lineage (
+            notebook      VARCHAR,
+            file_ref      VARCHAR,
+            direction     VARCHAR,
+            discovered_at TIMESTAMP
+        )
+    """)
+    return con
+
+def _should_skip(p: Path) -> bool:
+    return any(part in SKIP_DIR_NAMES or part.startswith(".") and part not in {".", ".."}
+               for part in p.parts)
+
+def _kind_of(p: Path) -> str:
+    parts = set(p.parts)
+    if "raw" in parts:       return "raw"
+    if "processed" in parts: return "processed"
+    if "external" in parts:  return "external"
+    if "reports" in parts:   return "report"
+    if "models" in parts:    return "model"
+    return "other"
+
+def _project_of(p: Path) -> str:
+    try:
+        rel = p.relative_to(PROJECTS_DIR)
+        return rel.parts[0] if rel.parts else "_root"
+    except ValueError:
+        return "_external"
+
+def _hash_head(p: Path, limit_mb: int = 10) -> str:
+    """Hash only the first N MB — fast 'fingerprint' for catalog change detection."""
+    h = hashlib.md5()
+    limit = limit_mb * 1024 * 1024
+    read = 0
+    try:
+        with open(p, "rb") as f:
+            while read < limit:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                h.update(chunk)
+                read += len(chunk)
+        return h.hexdigest()[:12]
+    except OSError:
+        return ""
+
+def _fmt_size(n: int) -> str:
+    x = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if x < 1024:
+            return f"{x:.1f}{unit}"
+        x /= 1024
+    return f"{x:.1f}PB"
+
+def _pretty_path(s: str) -> str:
+    return s.replace(str(Path.home()), "~")
+
+# ── catalog scan ──────────────────────────────────────────────────────────────
+@catalog_app.command("scan")
+def catalog_scan(
+    path: Path = typer.Option(PROJECTS_DIR, "--path", "-p", help="Raiz para varrer"),
+    deep_hash: bool = typer.Option(False, "--deep-hash", help="Hash completo (lento)"),
+):
+    """Varre o diretório de projetos e atualiza o catálogo local."""
+    if not path.exists():
+        console.print(f"[red]✘ Caminho não encontrado: {path}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]→[/cyan] Varrendo [bold]{_pretty_path(str(path))}[/bold] …")
+    con = _conn()
+    now = datetime.now(timezone.utc)
+
+    # Data files
+    seen = new = 0
+    for p in path.rglob("*"):
+        if not p.is_file() or _should_skip(p):
+            continue
+        if p.suffix.lower() not in DATA_EXTS:
+            continue
+        seen += 1
+        st = p.stat()
+        h = _hash_head(p, limit_mb=500 if deep_hash else 10)
+        existing = con.execute("SELECT 1 FROM files WHERE path = ?", [str(p)]).fetchone()
+        if not existing:
+            new += 1
+        con.execute("""
+            INSERT OR REPLACE INTO files
+            (path, project, kind, format, size_bytes, hash_prefix, last_modified, last_scanned)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            str(p), _project_of(p), _kind_of(p),
+            p.suffix.lower().lstrip("."),
+            st.st_size, h,
+            datetime.fromtimestamp(st.st_mtime, tz=timezone.utc),
+            now,
+        ])
+
+    # Rebuild lineage from notebooks / scripts
+    con.execute("DELETE FROM lineage")
+    notebooks = edges = 0
+    for p in path.rglob("*"):
+        if not p.is_file() or _should_skip(p) or p.suffix.lower() not in CODE_EXTS:
+            continue
+        notebooks += 1
+        try:
+            text = p.read_text(errors="ignore")
+        except OSError:
+            continue
+        for pat in READ_PATTERNS:
+            for m in pat.finditer(text):
+                con.execute("INSERT INTO lineage VALUES (?, ?, 'read', ?)",
+                            [str(p), m.group(1), now])
+                edges += 1
+        for pat in WRITE_PATTERNS:
+            for m in pat.finditer(text):
+                con.execute("INSERT INTO lineage VALUES (?, ?, 'write', ?)",
+                            [str(p), m.group(1), now])
+                edges += 1
+    con.close()
+
+    console.print(Panel.fit(
+        f"[green]✔[/green] Scan concluído\n"
+        f"  [dim]Arquivos de dados:[/dim] {seen} indexados  ·  {new} novos\n"
+        f"  [dim]Scripts/notebooks:[/dim] {notebooks} analisados\n"
+        f"  [dim]Arestas de linhagem:[/dim] {edges}\n"
+        f"  [dim]Catálogo em:[/dim] {_pretty_path(str(CATALOG_DB))}",
+        title="[bold]dlab catalog scan[/bold]",
+        border_style="green",
+    ))
+
+# ── catalog list ──────────────────────────────────────────────────────────────
+@catalog_app.command("list")
+def catalog_list(
+    project: str = typer.Option(None, "--project", "-P"),
+    kind: str = typer.Option(None, "--kind", "-k", help="raw|processed|external|report|model|other"),
+    fmt: str = typer.Option(None, "--format", "-f", help="csv|parquet|…"),
+    limit: int = typer.Option(50, "--limit", "-n"),
+):
+    """Lista arquivos rastreados no catálogo."""
+    con = _conn()
+    where, params = [], []
+    if project: where.append("project = ?"); params.append(project)
+    if kind:    where.append("kind = ?");    params.append(kind)
+    if fmt:     where.append("format = ?");  params.append(fmt)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = con.execute(f"""
+        SELECT project, kind, format, path, size_bytes, last_modified
+        FROM files {clause}
+        ORDER BY last_modified DESC
+        LIMIT ?
+    """, params + [limit]).fetchall()
+    con.close()
+
+    if not rows:
+        console.print("[yellow]Catálogo vazio. Rode:[/yellow] [cyan]dlab catalog scan[/cyan]")
+        return
+
+    t = Table(title=f"dlab catalog · {len(rows)} arquivos")
+    t.add_column("Project", style="cyan")
+    t.add_column("Kind", style="magenta")
+    t.add_column("Fmt", style="yellow")
+    t.add_column("Path", style="dim")
+    t.add_column("Size", justify="right", style="green")
+    t.add_column("Modified", style="dim")
+    for proj, k, f, pth, sz, lm in rows:
+        t.add_row(proj, k, f, _pretty_path(pth), _fmt_size(sz), lm.strftime("%Y-%m-%d %H:%M"))
+    console.print(t)
+
+# ── catalog show ──────────────────────────────────────────────────────────────
+@catalog_app.command("show")
+def catalog_show(file: str):
+    """Mostra metadados detalhados de um arquivo (busca por nome ou caminho parcial)."""
+    con = _conn()
+    row = con.execute("SELECT * FROM files WHERE path = ?", [file]).fetchone()
+    cols = [d[0] for d in con.description] if row else []
+    if not row:
+        rows = con.execute("SELECT * FROM files WHERE path LIKE ?", [f"%{file}%"]).fetchall()
+        cols = [d[0] for d in con.description]
+        if not rows:
+            console.print(f"[red]✘ Não encontrado no catálogo:[/red] {file}")
+            con.close()
+            raise typer.Exit(1)
+        if len(rows) > 1:
+            console.print(f"[yellow]{len(rows)} correspondências — refine:[/yellow]")
+            for r in rows[:15]:
+                console.print(f"  • {_pretty_path(r[0])}")
+            con.close()
+            return
+        row = rows[0]
+    con.close()
+    body = "\n".join(f"[cyan]{c}:[/cyan] {v}" for c, v in zip(cols, row))
+    console.print(Panel(body, title=_pretty_path(row[0]), border_style="cyan"))
+
+# ── catalog lineage ───────────────────────────────────────────────────────────
+@catalog_app.command("lineage")
+def catalog_lineage(file: str):
+    """Mostra quais notebooks/scripts leram ou escreveram o arquivo."""
+    con = _conn()
+    reads = con.execute("""
+        SELECT DISTINCT notebook FROM lineage
+        WHERE direction = 'read' AND (file_ref = ? OR file_ref LIKE ?)
+        ORDER BY notebook
+    """, [file, f"%{file}"]).fetchall()
+    writes = con.execute("""
+        SELECT DISTINCT notebook FROM lineage
+        WHERE direction = 'write' AND (file_ref = ? OR file_ref LIKE ?)
+        ORDER BY notebook
+    """, [file, f"%{file}"]).fetchall()
+    con.close()
+
+    tree = Tree(f"[bold]{file}[/bold]")
+    w = tree.add("[green]⇐ ESCRITO POR[/green]")
+    if writes:
+        for (nb,) in writes:
+            w.add(_pretty_path(nb))
+    else:
+        w.add("[dim](sem escritores detectados)[/dim]")
+    r = tree.add("[blue]⇒ LIDO POR[/blue]")
+    if reads:
+        for (nb,) in reads:
+            r.add(_pretty_path(nb))
+    else:
+        r.add("[dim](sem leitores detectados)[/dim]")
+    console.print(tree)
+
+# ── describe ──────────────────────────────────────────────────────────────────
+@app.command("describe")
+def describe(file: str, rows: int = typer.Option(5, "--rows", "-n")):
+    """Perfil rápido: shape, dtypes, % de nulos, head."""
+    p = Path(file).expanduser().resolve()
+    if not p.exists():
+        console.print(f"[red]✘ Não encontrado:[/red] {p}")
+        raise typer.Exit(1)
+    try:
+        import polars as pl
+    except ImportError:
+        console.print("[red]polars não instalado.[/red] Rode: [cyan]pip install polars[/cyan]")
+        raise typer.Exit(1)
+
+    readers = {
+        ".csv":     pl.read_csv,
+        ".tsv":     lambda x: pl.read_csv(x, separator="\t"),
+        ".parquet": pl.read_parquet,
+        ".json":    pl.read_json,
+        ".jsonl":   pl.read_ndjson,
+        ".xlsx":    pl.read_excel,
+        ".xls":     pl.read_excel,
+    }
+    reader = readers.get(p.suffix.lower())
+    if not reader:
+        console.print(f"[red]Formato não suportado:[/red] {p.suffix}")
+        raise typer.Exit(1)
+
+    try:
+        df = reader(p)
+    except Exception as exc:
+        console.print(f"[red]Falha ao ler:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(Panel.fit(
+        f"[bold]{p.name}[/bold]  ·  {df.shape[0]:,} linhas × {df.shape[1]} colunas  ·  {_fmt_size(p.stat().st_size)}",
+        border_style="cyan",
+    ))
+    t = Table(title="Schema & nulos")
+    t.add_column("Coluna")
+    t.add_column("Tipo", style="yellow")
+    t.add_column("Nulos %", justify="right", style="red")
+    n = df.shape[0] or 1
+    for col in df.columns:
+        pct = df[col].null_count() / n * 100
+        t.add_row(col, str(df[col].dtype), f"{pct:.1f}%")
+    console.print(t)
+    console.print("\n[dim]Head:[/dim]")
+    console.print(df.head(rows))
+
+# ── doctor ────────────────────────────────────────────────────────────────────
+@app.command("doctor")
+def doctor():
+    """Diagnóstico do ambiente: verifica ferramentas essenciais do Data Lab."""
+    def _bin(name): return shutil.which(name)
+    checks = [
+        ("Python ≥ 3.12",      sys.version_info[:2] >= (3, 12),  sys.version.split()[0]),
+        ("pyenv",              _bin("pyenv") is not None,        _bin("pyenv") or "não encontrado"),
+        ("Docker CLI",         _bin("docker") is not None,       _bin("docker") or "não encontrado"),
+        ("DuckDB CLI",         _bin("duckdb") is not None,       _bin("duckdb") or "não encontrado"),
+        ("Jupyter",            _bin("jupyter") is not None,      _bin("jupyter") or "não encontrado"),
+        ("psql (PostgreSQL)",  _bin("psql") is not None,         _bin("psql") or "não encontrado"),
+        ("redis-cli",          _bin("redis-cli") is not None,    _bin("redis-cli") or "não encontrado"),
+        ("git",                _bin("git") is not None,          _bin("git") or "não encontrado"),
+        ("~/data-projects",    PROJECTS_DIR.exists(),            str(PROJECTS_DIR)),
+        ("Catálogo dlab",      CATALOG_DB.exists(),              str(CATALOG_DB) if CATALOG_DB.exists() else "rode: dlab catalog scan"),
+    ]
+    t = Table(title="dlab doctor")
+    t.add_column("Check")
+    t.add_column("Status", justify="center")
+    t.add_column("Detalhe", style="dim")
+    for name, ok, msg in checks:
+        t.add_row(name, "[green]✔[/green]" if ok else "[red]✘[/red]", msg)
+    console.print(t)
+    failed = sum(1 for _, ok, _ in checks if not ok)
+    if failed:
+        console.print(f"\n[yellow]{failed} problema(s) detectado(s).[/yellow]")
+    else:
+        console.print("\n[green]Ambiente saudável.[/green]")
+
+if __name__ == "__main__":
+    app()
